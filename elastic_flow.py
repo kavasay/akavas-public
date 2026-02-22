@@ -95,12 +95,52 @@ def main():
 
     payload = build_payload(subnets, days=args.days, agg_size=args.size)
 
-    # Dry-run prints payload only (safe)
+    # Dry-run: test credentials and perform a lightweight 1-day query (no CSV output)
     if args.dry_run:
-        print('DRY RUN: ES URL:', args.es_url)
-        print('DRY RUN: Index:', args.index)
-        print(json.dumps(payload, indent=2))
-        logging.info('Dry-run complete. No requests were sent to Elasticsearch.')
+        # Respect wildcard safety checks in dry-run as well
+        if '*' in args.index and not args.allow_wildcard:
+            logging.error('Index contains wildcard. Re-run with --allow-wildcard to proceed intentionally.')
+            sys.exit(2)
+        if '*' in args.index and not args.confirm:
+            if not confirm(f"Index '{args.index}' contains a wildcard. Proceed with dry-run query?"):
+                logging.info('Aborted by user.')
+                sys.exit(0)
+
+        verify = not args.insecure
+        if not verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        headers = {'Content-Type': 'application/json'}
+        test_url = f"{args.es_url.rstrip('/')}/{args.index}/_search"
+
+        logging.info('DRY RUN: testing credentials and sending lightweight 1-day query to %s', test_url)
+
+        test_payload = {
+            'size': 0,
+            'query': {
+                'bool': {
+                    'filter': [
+                        {'range': {'@timestamp': {'gte': 'now-1d/d', 'lte': 'now/d'}}}
+                    ]
+                }
+            }
+        }
+
+        try:
+            test_resp = requests.post(test_url, auth=(username, password), headers=headers,
+                                      data=json.dumps(test_payload), verify=verify, timeout=args.timeout)
+            test_resp.raise_for_status()
+            logging.info('Dry-run: authentication and basic query succeeded (status %s).', test_resp.status_code)
+            try:
+                jr = test_resp.json()
+                logging.info('Dry-run: JSON response received. hits: %s', jr.get('hits', {}).get('total'))
+            except ValueError:
+                logging.info('Dry-run: non-JSON response but request succeeded.')
+        except requests.exceptions.RequestException as e:
+            logging.error('Dry-run test request failed: %s', e)
+            sys.exit(1)
+
+        logging.info('Dry-run complete. No CSV was written.')
         return
 
     # If the target is a broad/wildcard index, require confirmation unless --confirm was passed
